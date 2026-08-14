@@ -1,0 +1,10 @@
+{
+  "name": "boris-news-bot",
+  "version": "14.1.0",
+  "description": "Борис — бот новостей и трендов для Битрикс24",
+  "main": "brazil-news-bot/index.js",
+  "scripts": {
+    "start": "node brazil-news-bot/index.js"
+  },
+  "dependencies": {}
+}

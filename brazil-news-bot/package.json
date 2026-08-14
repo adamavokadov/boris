@@ -1,0 +1,10 @@
+{
+  "name": "brazil-news-bot",
+  "version": "1.0.0",
+  "description": "Daily Brazil news briefing for PMEs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {}
+}

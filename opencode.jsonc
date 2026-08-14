@@ -1,0 +1,64 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "b24cowork",
+  "mcp": {
+    "openwork-browser": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64883/mcp"
+    },
+    "chrome": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64884/mcp"
+    },
+    "bitrix24": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64886/mcp"
+    },
+    "attachments": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64888/mcp"
+    },
+    "memory": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64890/mcp"
+    },
+    "openwork-ui": {
+      "type": "remote",
+      "url": "http://127.0.0.1:51081/mcp"
+    }
+  },
+  "permission": {
+    "*": "allow",
+    "bash": {
+      "*": "allow",
+      "rm *": "ask",
+      "* rm *": "ask",
+      "*/rm *": "ask",
+      "rmdir *": "ask",
+      "* rmdir *": "ask",
+      "*/rmdir *": "ask",
+      "mv *": "ask",
+      "* mv *": "ask",
+      "*/mv *": "ask",
+      "shred *": "ask",
+      "* shred *": "ask",
+      "*/shred *": "ask",
+      "truncate *": "ask",
+      "* truncate *": "ask",
+      "*/truncate *": "ask",
+      "git clean*": "ask",
+      "* git clean*": "ask",
+      "*/git clean*": "ask",
+      "git reset --hard*": "ask",
+      "* git reset --hard*": "ask",
+      "*/git reset --hard*": "ask",
+      "git checkout -- *": "ask",
+      "* git checkout -- *": "ask",
+      "*/git checkout -- *": "ask",
+      "dd *of=*": "ask",
+      "* dd *of=*": "ask",
+      "*/dd *of=*": "ask",
+      "* -delete*": "ask"
+    }
+  }
+}
