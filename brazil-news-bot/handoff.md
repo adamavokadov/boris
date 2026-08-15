@@ -1,0 +1,197 @@
+# Handoff — Борис (brazil-news-bot)
+
+> ⚠️ **Этот файл никогда не удаляется.** Он обновляется после КАЖДОГО
+> нового патча (спринта), кем бы патч ни был написан — человеком, Claude
+> в новой сессии, или любым другим инструментом. Если начинаешь новую
+> сессию работы над этим ботом, прочитай этот файл первым — он экономит
+> тебе полный повторный анализ кода. Обновляя этот файл, дополняй секцию
+> "История спринтов" и держи "Текущее состояние" в актуальном виде;
+> не переписывай старые записи истории — они полезны как есть.
+
+## Что это
+
+AI-бот **«Борис»** для Битрикс24 (платформа vibecode), написан на Node.js
+без внешних фреймворков (только `http`, `https`, `fs`, `path` из stdlib).
+Каждый будний день собирает и присылает одному пользователю дайджест
+интересных историй и трендов (AI/tech, вирусное, наука, поп-культура,
+бизнес/стартапы) по рынку Бразилии, отвечает на команды и умеет вести
+свободный диалог через LLM.
+
+Владелец проекта работает в PR/контент-менеджменте Bitrix24, ведёт
+бразильский регион.
+
+## Текущее состояние (после спринтов 0–3)
+
+- **Версия:** v14.3
+- **Файлы:** `index.js` (весь код бота), `personality.js` (быстрые
+  regex-паттерны для приветствия/благодарности/прощания), `package.json`,
+  `README.md`, `icon.svg`, `.gitignore`, `.env.example`,
+  `scripts/check-secrets.sh`
+- **Удалено (спринт 0):** `app.tar.gz.base64` (устаревший build-артефакт
+  с кодом v13.8), `make_avatar.py`, `make_avatar2.py` (черновики аватарки,
+  больше не нужны — аватар уже сгенерирован и загружен)
+- **Платформа:** Bitrix24 vibecode, galaxy-сервер (засыпает через 60 мин
+  простоя, просыпается по cron `0 9 * * 1-5` Europe/Moscow)
+- **LLM:** `bitrix/bitrixgpt-5.5` через `https://vibecode.bitrix24.tech/v1/chat/completions`,
+  вызывается в двух местах: `generateDigest()` (сам дайджест) и
+  `generateConversationalReply()` (свободный диалог)
+- **Секреты:** НЕ хранятся в репозитории нигде (ни в коде, ни в README, ни
+  в архиве деплоя) — только как переменные окружения на сервере деплоя,
+  подставляются вручную в момент каждого деплоя. Бот падает при старте
+  с понятной ошибкой, если `VIBE_API_KEY` не задан. См. `README.md` →
+  раздел «Безопасность» для протокола на случай утечки (ротация ключа —
+  обязательный первый шаг).
+
+## Архитектура index.js (карта функций)
+
+```
+Настройки:
+  DEFAULT_SETTINGS, loadSettings(), saveSettings()
+    — persist в /data/settings.json (galaxy volume), merge с дефолтами
+
+HTTP-утилиты:
+  makeRequest(url, options)      — обёртка над https, JSON in/out
+
+Форматирование:
+  formatDateBR(date), getDates()
+
+Bitrix24 UI:
+  getMainKeyboard(), getFeedbackKeyboard()
+  sendBotMessage(dialogId, text, keyboard)
+  showTyping(dialogId, statusCode, duration)
+  withTyping(dialogId, statusCode, fn)  — держит "печатает..." на время
+    долгой операции (fn), т.к. один вызов showTyping живёт только N сек
+
+Поиск/сбор данных:
+  getSearchQueries(dates), getTrendQueries(dates)
+  searchNews(query)              — веб-поиск через LLM-платформу
+  collectRawNews()                — по всем topic-запросам
+  fetchTrends24()                  — regex-скрейпинг trends24.in/brazil
+  fetchGoogleTrends()               — Google Trends RSS
+  collectTrends()                    — объединяет trends24 + googletrends
+  SOURCES[]                           — 5 курируемых источников:
+    habr, bloomberglinea, googlenews, folha, cnnbrasil
+  fetchSourceHeadlines(source)         — regex-экстракция заголовков,
+    2 попытки на источник, retry через 1.5с
+  fetchBreakingNews()                   — "Just In" через поиск
+  collectSourceNews()                    — по всем SOURCES
+
+Health-check источников (спринт 2):
+  recordSourceHealth(id, count, err)      — трекинг подряд-пустых fetch'ей
+  getUnhealthySources()                    — источники с 3+ пустыми подряд
+  settings.sourceHealth{}                   — персистится
+
+LLM-генерация:
+  generateDigest(rawNews, trendNews, sourceNews, extraInstructions)
+    — основной промпт, формирует дайджест из сырых данных
+  getPersonaSystemPrompt(userName)          — промпт личности Бориса
+    для свободного диалога (спринт 1)
+  generateConversationalReply(dialogId, text, userName)
+    — LLM-ответ на свободный ввод, с историей диалога
+
+Память диалога (спринт 1, in-memory, НЕ персистится):
+  conversationHistory: Map<dialogId, [{role, content}, ...]>
+  pushHistory(), getHistory()               — капается на MAX_HISTORY_TURNS=8
+  awaitingFeedback: Set<dialogId>            — per-dialog (спринт 2, был
+    глобальный boolean settings.awaitingFeedback — чинили race condition)
+
+Планирование:
+  sendDailyBriefing(dialogId)                — утренний дайджест
+  scheduleHeavyJob(fn, key)                    — guard от параллельного
+    запуска тяжёлых команд (/news, /showtrends, /surprise)
+
+Команды (handleCommand, switch по command):
+  start/hello/hi, news/briefing, showtrends, surprise/random, settings,
+  feedback, help, status, sourcehealth (спринт 2), reset (спринт 1),
+  lang, trends, topics, addtopic, removetopic, schedule, settime, on, off
+
+Событийный цикл:
+  pollEvents()                                  — long-poll событий Bitrix24
+  handleEvent(event)                              — роутер:
+    ONIMBOTV2MESSAGEADD   — свободный текст: personality.js (быстро) →
+                             иначе generateConversationalReply() (LLM) →
+                             иначе статичное меню (деградация при сбое LLM)
+    ONIMBOTV2COMMANDADD   — слэш-команды → handleCommand()
+```
+
+## Известные архитектурные ограничения (не исправлены, осознанный выбор)
+
+1. **Один пользователь.** `BITRIX_USER_ID` захардкожен как единственный
+   получатель дайджеста. `settings` (topics, lang, autoSend, time) —
+   общий на весь процесс, не per-workspace. Если бот когда-нибудь станет
+   multi-tenant — это первое, что придётся рефакторить.
+2. **`conversationHistory` не персистится.** Сбрасывается при рестарте
+   процесса/сне сервера. Осознанный компромисс (простота + приватность)
+   из спринта 1 — не баг.
+3. **Regex-скрейпинг источников хрупкий по природе.** Health-check
+   (спринт 2) даёт видимость деградации, но не чинит источник
+   автоматически — при срабатывании `/sourcehealth` на 🔴 всё ещё нужно
+   вручную посмотреть, что изменилось на сайте-источнике, и поправить
+   `source.extract()`.
+4. **Сервер засыпает через 60 мин простоя** (ограничение платформы
+   galaxy, `GALAXY_APP_USE_GALAXY_ROUTE` — отключить нельзя). Единственный
+   способ гарантировать постоянную доступность — перенос на отдельный VM,
+   не рассматривался как приоритет.
+
+## История спринтов
+
+- **Спринт 0** — удалены `app.tar.gz.base64` (устаревший артефакт v13.8),
+  `make_avatar.py`, `make_avatar2.py`. Верифицировано, что скрипты
+  спринтов 1 и 2 не требовали правок (были байт-в-байт как выданы).
+- **Спринт 1** — LLM отвечает на свободный ввод, не попавший под
+  regex-паттерны `personality.js` (вместо статичного меню), с короткой
+  памятью диалога (`/reset`). Добавлены `process.on('uncaughtException'/
+  'unhandledRejection')` crash guards. `CHAT_MODEL` вынесен в константу.
+- **Спринт 2** — `/sourcehealth`: трекинг деградации скрейпинга по каждому
+  источнику (consecutive-empty-fetch streak, персистится). Исправлен race
+  condition: `settings.awaitingFeedback` (глобальный boolean) →
+  `awaitingFeedback` (per-dialog Set) — иначе фидбэк из одного диалога мог
+  ошибочно записаться как дизлайк из-за сообщения в другом диалоге.
+- **Спринт 3** — Безопасность репозитория: секреты полностью убраны из
+  README (были закоммичены в открытом виде — **владелец ротирует ключи
+  сам при следующем деплое**, это НЕ автоматизировано патчем и не должно
+  быть). Startup-валидация `VIBE_API_KEY` с понятной ошибкой вместо
+  падения где-то глубоко в API-вызовах. Созданы `.gitignore`,
+  `.env.example`, `scripts/check-secrets.sh` (grep-guard, можно повесить
+  как pre-commit hook). Попутно исправлен предсуществующий баг — команда
+  деплоя в README не включала `personality.js` в архив (бот упал бы при
+  старте после деплоя по этой команде).
+- **Спринт 4** — добавлены `handoff.md` (этот файл) и `roadmap.md`
+  (предложения по развитию бота, отражающие практики
+  news-digest/market-intelligence ботов 2026 года).
+
+## Соглашения патч-скриптов (`apply_sprintN_patch.py`)
+
+Если пишешь следующий патч (спринт 5+), следуй уже устоявшимся
+конвенциям — они проверены на практике за 4 спринта:
+
+- **Идемпотентность обязательна.** Каждое изменение — через
+  `replace_once(old, new, label, already_applied_marker)`: если marker уже
+  в файле — `[skip]`, если anchor не найден — `[WARN]` и пропуск (не
+  падать), если anchor найден 2+ раз — `[WARN]` и пропуск (не гадать).
+- **Pre-flight guard для зависимостей между спринтами.** Если патч N
+  зависит от патча N-1 (использует функции/переменные, которые тот
+  добавил), в начале — явная проверка маркера предыдущего спринта; если
+  его нет — печатать понятную инструкцию и **не применять вообще ничего**
+  (не оставлять файл в частично пропатченном состоянии). Пример в
+  `apply_sprint2_patch.py`/`apply_sprint3_patch.py`.
+- **Бэкапы перед любой записью** — `path.with_suffix(path.suffix +
+  f".{timestamp}.bak")`, копия перед `.write_text()`.
+- **Не жёстко фиксировать версии в анкорах, если строка не обновлялась
+  предыдущим скриптом.** Раньше это уже ловило баги (см. спринт 3 —
+  version-agnostic fallback для строки `index.js — весь код бота (vX.Y)`
+  в README, т.к. предыдущие скрипты её не трогали). Если сомневаешься,
+  обновлял ли предыдущий патч конкретную строку — проверь фактический
+  вывод предыдущего скрипта на чистой копии, не полагайся на память о
+  том, что "должно было" получиться.
+- **Тестировать на СВЕЖЕЙ копии оригинала, не только на уже пропатченной
+  рабочей копии.** Расхождения между "что я правил вручную для проверки"
+  и "что реально производит скрипт" — main source бага в этом проекте
+  (случалось трижды при подготовке спринта 3).
+- **`node --check index.js` после каждого патча**, плюс где применимо —
+  небольшой изолированный `node -e` unit-тест новой логики (health
+  tracking, per-dialog Set race condition — оба протестированы так до
+  того, как патч был выдан).
+- Каждый скрипт печатает в конце конкретные next steps (diff, syntax
+  check, commit/push команды) — сохраняй этот паттерн для консистентности
+  UX между спринтами.
