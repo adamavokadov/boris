@@ -1,0 +1,33 @@
+# --- Secrets: never commit these ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# --- Local backups created by patch scripts (apply_sprintN_patch.py) ---
+*.bak
+.sprint0-removed-*/
+
+# --- Node ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- Local runtime data (bot settings persist to /data in production;
+#     this covers a local dev copy of the same file) ---
+data/
+settings.json
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- Deploy archive is regenerated at deploy time (see README "Как
+#     задеплоить"); keep it out of git so stale builds can't be pushed
+#     by accident. Comment these two lines out if you intentionally want
+#     to version the built artifact instead of regenerating it. ---
+app.tar.gz
+app.tar.gz.base64
