@@ -61,7 +61,11 @@ const DEFAULT_SETTINGS = {
   // Per-source scrape health: lets /status and /sourcehealth surface silent
   // degradation (e.g. a site changes its HTML and our regex extractor
   // starts returning 0 headlines) instead of failing invisibly forever.
-  sourceHealth: {}
+  sourceHealth: {},
+  // Cross-run dedup (sprint 6): normalized-headline -> ISO timestamp of the
+  // last time it was actually included in a sent digest. Pruned to the last
+  // SENT_HISTORY_DAYS days on every save so this can't grow unbounded.
+  recentlySentHeadlines: {}
 };
 
 // Bot settings (loaded from disk, falls back to defaults)
@@ -734,6 +738,122 @@ async function fetchTrends24() {
 }
 
 // Fetch headlines from curated external sources (habr, bloomberglinea, google news)
+// --- Pre-LLM deduplication and scoring (sprint 6) --------------------
+// Cheap, dependency-free near-duplicate detection over headline strings.
+// No embeddings/external calls — this runs synchronously over every
+// headline in a collection run and needs to stay fast and free.
+const DEDUP_SIMILARITY_THRESHOLD = 0.45; // Jaccard word-overlap, 0-1 — tuned against
+// a sample of realistic PT-BR near-duplicate headline pairs (paraphrased by
+// different outlets), which scored 0.50-0.71, vs genuinely distinct stories
+// (including ones sharing a common subject word like "Brasil"), which scored
+// 0.00-0.10. 0.45 sits in the gap between those two clusters.
+const SENT_HISTORY_DAYS = 3; // how long a sent headline blocks a repeat
+
+// Authority bonus per source id. Deliberately additive-only (no negative
+// entries): a source absent from this map just gets +0, never demoted, so
+// this can't silently bury a source nobody got around to rating.
+const SOURCE_PRIORITY = {
+  bloomberglinea: 2,
+  cnnbrasil: 2
+};
+
+function normalizeForDedup(title) {
+  return (title || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // strip accents
+    .replace(/[^\w\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function titleSimilarity(a, b) {
+  const wordsA = new Set(normalizeForDedup(a).split(' ').filter(w => w.length > 2));
+  const wordsB = new Set(normalizeForDedup(b).split(' ').filter(w => w.length > 2));
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  let intersection = 0;
+  for (const w of wordsA) { if (wordsB.has(w)) intersection++; }
+  const union = wordsA.size + wordsB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+// Prune recentlySentHeadlines older than SENT_HISTORY_DAYS. Called before
+// every filter/record pass so the map never grows unbounded.
+function pruneSentHistory() {
+  if (!settings.recentlySentHeadlines) { settings.recentlySentHeadlines = {}; return; }
+  const cutoff = Date.now() - SENT_HISTORY_DAYS * 24 * 60 * 60 * 1000;
+  for (const [key, iso] of Object.entries(settings.recentlySentHeadlines)) {
+    if (new Date(iso).getTime() < cutoff) delete settings.recentlySentHeadlines[key];
+  }
+}
+
+function wasRecentlySent(title) {
+  pruneSentHistory();
+  return Object.prototype.hasOwnProperty.call(settings.recentlySentHeadlines, normalizeForDedup(title));
+}
+
+function recordSentHeadlines(titles) {
+  pruneSentHistory();
+  const now = new Date().toISOString();
+  for (const t of titles) {
+    settings.recentlySentHeadlines[normalizeForDedup(t)] = now;
+  }
+  saveSettings();
+}
+
+// Tracks how many near-duplicates the last collection run collapsed, for
+// /status visibility. Reset at the start of each dedupeAndScoreHeadlines() call.
+let lastDedupStats = { input: 0, output: 0, collapsed: 0, blockedRepeats: 0 };
+
+// items: [{ title, sourceId, sourceName, position }], position = index in
+// its own source's listing (0 = first/most prominent on that page/feed).
+// Returns items deduped (near-duplicates collapsed to their
+// highest-scored representative) and sorted by score descending.
+function dedupeAndScoreHeadlines(items) {
+  const filtered = items.filter(it => !wasRecentlySent(it.title));
+  const blockedRepeats = items.length - filtered.length;
+
+  const scored = filtered.map(it => {
+    const priorityBonus = SOURCE_PRIORITY[it.sourceId] || 0;
+    const recencyBonus = Math.max(0, 3 - Math.floor(it.position / 3)); // earlier in listing = fresher, tapers off
+    return { ...it, score: priorityBonus + recencyBonus, seenInSources: new Set([it.sourceId]) };
+  });
+
+  // Group near-duplicates. O(n^2) over headlines from one collection run
+  // (tens, not thousands) — fine at this scale, revisit if SOURCES grows a lot.
+  const groups = [];
+  for (const item of scored) {
+    let placed = false;
+    for (const group of groups) {
+      if (titleSimilarity(item.title, group.best.title) >= DEDUP_SIMILARITY_THRESHOLD) {
+        group.best.seenInSources.add(item.sourceId);
+        // A story independently picked up by more than one source is more
+        // likely to actually matter — small bonus, captured before the
+        // duplicate itself is dropped below.
+        if (group.best.seenInSources.size > 1) {
+          group.best.score += 1;
+        }
+        if (item.score > group.best.score) {
+          const mergedSources = group.best.seenInSources;
+          group.best = item;
+          group.best.seenInSources = mergedSources;
+        }
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) groups.push({ best: item });
+  }
+
+  const result = groups.map(g => g.best).sort((a, b) => b.score - a.score);
+  lastDedupStats = {
+    input: items.length,
+    output: result.length,
+    collapsed: filtered.length - result.length,
+    blockedRepeats
+  };
+  return result;
+}
+
 const SOURCES = [
   {
     id: 'habr',
@@ -929,27 +1049,63 @@ async function fetchBreakingNews() {
 }
 
 async function collectSourceNews() {
-  const results = [];
+  // Flatten every source's headlines into one list FIRST, so dedup can
+  // catch the same story picked up by two different sources — that was
+  // previously impossible because each source's headlines were joined into
+  // prose before the next source was even fetched.
+  const flat = [];
+  const sourceMeta = {}; // sourceId -> { name }
   for (const source of SOURCES) {
     const titles = await fetchSourceHeadlines(source);
-    if (titles.length > 0) {
-      results.push({
-        topic: source.name,
-        source: source.id,
-        raw: `Свежие заголовки из источника «${source.name}»:\n` + titles.map((t, i) => `${i+1}. ${t}`).join('\n')
-      });
-    }
+    sourceMeta[source.id] = { name: source.name };
+    titles.forEach((title, position) => {
+      flat.push({ title, sourceId: source.id, sourceName: source.name, position });
+    });
     await new Promise(resolve => setTimeout(resolve, 800));
   }
   // Add WatcherGuru-style "Just In" breaking news via search
   const breaking = await fetchBreakingNews();
-  if (breaking.length > 0) {
-    results.push({
-      topic: 'WatcherGuru-style «Just In» breaking news',
-      source: 'breaking',
-      raw: 'Самые свежие «Just In» новости (в стиле WatcherGuru):\n' + breaking.map((h, i) => `${i+1}. ${h}`).join('\n')
-    });
+  sourceMeta.breaking = { name: 'WatcherGuru-style «Just In» breaking news' };
+  breaking.forEach((title, position) => {
+    flat.push({ title, sourceId: 'breaking', sourceName: sourceMeta.breaking.name, position });
+  });
+
+  const deduped = dedupeAndScoreHeadlines(flat);
+  console.log(`[dedup] ${lastDedupStats.input} headlines in, ${lastDedupStats.collapsed} near-duplicates collapsed, ${lastDedupStats.blockedRepeats} already-sent repeats blocked, ${lastDedupStats.output} out`);
+
+  // Regroup by source for the digest prompt, preserving the existing
+  // per-source `raw` text format so generateDigest()'s prompt is unchanged —
+  // only which headlines make it in, and their order (highest-scored first
+  // within each source), is different.
+  const bySource = {};
+  for (const item of deduped) {
+    if (!bySource[item.sourceId]) bySource[item.sourceId] = [];
+    bySource[item.sourceId].push(item.title);
   }
+
+  const results = [];
+  for (const [sourceId, titles] of Object.entries(bySource)) {
+    const name = sourceMeta[sourceId] ? sourceMeta[sourceId].name : sourceId;
+    if (sourceId === 'breaking') {
+      results.push({
+        topic: name,
+        source: sourceId,
+        raw: 'Самые свежие «Just In» новости (в стиле WatcherGuru):\n' + titles.map((t, i) => `${i+1}. ${t}`).join('\n')
+      });
+    } else {
+      results.push({
+        topic: name,
+        source: sourceId,
+        raw: `Свежие заголовки из источника «${name}»:\n` + titles.map((t, i) => `${i+1}. ${t}`).join('\n')
+      });
+    }
+  }
+  // Record what actually made it into this collection run so a same-day
+  // re-run of /news won't repeat these headlines verbatim. Recorded here
+  // (collection time) rather than only after a successful send, since a
+  // failed digest generation shouldn't leave the same near-duplicates
+  // eligible again on an immediate retry either.
+  recordSentHeadlines(deduped.map(d => d.title));
   return results;
 }
 
@@ -1211,6 +1367,7 @@ async function handleCommand(command, params, dialogId) {
         `👍 Оценки: ${settings.feedback.good} 👍 / ${settings.feedback.bad} 👎\n` +
         `🧠 AI-генерация дайджеста: включена\n` +
         `💬 Свободный диалог через LLM: включен (память ${MAX_HISTORY_TURNS} реплик, /reset — очистить)\n` +
+        `🧹 Дедуп (посл. сбор): ${lastDedupStats.input} → ${lastDedupStats.output} (склеено ${lastDedupStats.collapsed}, повторов заблокировано ${lastDedupStats.blockedRepeats})\n` +
         healthLine +
         `🔧 Версия: ${VERSION}`,
         getMainKeyboard()
