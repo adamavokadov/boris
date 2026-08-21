@@ -65,7 +65,17 @@ const DEFAULT_SETTINGS = {
   // Cross-run dedup (sprint 6): normalized-headline -> ISO timestamp of the
   // last time it was actually included in a sent digest. Pruned to the last
   // SENT_HISTORY_DAYS days on every save so this can't grow unbounded.
-  recentlySentHeadlines: {}
+  recentlySentHeadlines: {},
+  // Per-story feedback (sprint 7): 👍/👎 attached to each individual story
+  // in a digest, not just one rating for the whole digest. topicCounts is
+  // the aggregate signal ("which topics keep getting thumbed down") that
+  // roadmap.md's scoring/personalization sprints (6, 9) can eventually use;
+  // recentReactions keeps the last STORY_FEEDBACK_HISTORY_LIMIT individual
+  // reactions for /status visibility, most recent first.
+  storyFeedback: {
+    topicCounts: {},
+    recentReactions: []
+  }
 };
 
 // Bot settings (loaded from disk, falls back to defaults)
@@ -435,28 +445,28 @@ async function generateDigest(rawNews, trendNews, sourceNews = [], extraInstruct
 - ОБЯЗАТЕЛЬНО показывай дату у каждой истории и каждого тренда — это критично, чтобы пользователь видел свежесть
 ${feedbackInstructions}
 
-Формат выдачи:
-- 5-7 самых интересных историй + блок свежих трендов
-- В конце — «Резюме дня» (1-2 предложения, что сегодня самое интересное)
-
-Формат ответа:
-✨ Борис: самое интересное сегодня
-📅 {даты}
-
-[тема]: [цепляющий заголовок]
-📅 [дата публикации/актуальности]
-[суть истории]
-[почему это интересно]
-
-🔗 Источник
-
-...
-
-🔥 Тренды (свежие): [что сейчас в тренде]
-📅 [дата актуальности тренда]
-[краткое описание]
-
-📌 Резюме дня: [1-2 предложения]`
+Формат выдачи — строго JSON, без markdown-разметки вокруг, без текста до или после JSON. Схема:
+{
+  "summary": "1-2 предложения — что сегодня самое интересное",
+  "stories": [
+    {
+      "topic": "категория из списка выше",
+      "title": "цепляющий заголовок",
+      "date": "дата публикации/актуальности, например 10/08/2026 или сегодня",
+      "body": "суть истории, 2-3 предложения: что произошло, где, когда",
+      "why": "почему это интересно/забавно/удивительно",
+      "source": "ссылка на первоисточник или название источника, если ссылки нет"
+    }
+  ],
+  "trends": [
+    {
+      "topic": "название тренда",
+      "date": "дата актуальности тренда",
+      "body": "почему тема в тренде прямо сейчас и почему это интересно"
+    }
+  ]
+}
+5-7 историй в "stories". "trends" может быть пустым массивом, если трендов не было в исходных данных. Каждая история и каждый тренд ОБЯЗАТЕЛЬНО должны иметь непустое поле "date" — без даты запись не принимается.`
     : `Você é o Boris, um curador de histórias interessantes e em alta. Todos os dias você reúne as notícias MAIS interessantes, inesperadas e virais do mundo — aquelas que as pessoas realmente comentam e querem encaminhar para um amigo.
 
 Seu principal objetivo é o "fator uau": histórias que surpreendem, divertem e dão assunto para conversa. Exemplo de ótima história: "Na Austrália, a IA Claude hackeou um site para inscrever seu dono na academia". É esse tipo de história que precisamos.
@@ -504,28 +514,28 @@ Princípios:
 - OBRIGATÓRIO mostrar a data em cada história e cada tendência — é crítico para o usuário ver a frescura
 ${feedbackInstructions}
 
-Formato de saída:
-- 5-7 histórias mais interessantes + bloco de tendências frescas
-- No final — «Resumo do dia» (1-2 frases sobre o que é mais interessante hoje)
-
-Formato da resposta:
-✨ Boris: o mais interessante hoje
-📅 {datas}
-
-[tema]: [título cativante]
-📅 [data de publicação/atualidade]
-[essência da história]
-[por que é interessante]
-
-🔗 Fonte
-
-...
-
-🔥 Tendências (frescas): [o que está em alta agora]
-📅 [data de atualidade da tendência]
-[breve descrição]
-
-📌 Resumo do dia: [1-2 frases]`;
+Formato de saída — estritamente JSON, sem markdown ao redor, sem texto antes ou depois do JSON. Esquema:
+{
+  "summary": "1-2 frases — o que é mais interessante hoje",
+  "stories": [
+    {
+      "topic": "categoria da lista acima",
+      "title": "título cativante",
+      "date": "data de publicação/atualidade, ex.: 10/08/2026 ou hoje",
+      "body": "essência da história, 2-3 frases: o que aconteceu, onde, quando",
+      "why": "por que é interessante/engraçado/surpreendente",
+      "source": "link para a fonte original ou nome da fonte, se não houver link"
+    }
+  ],
+  "trends": [
+    {
+      "topic": "nome da tendência",
+      "date": "data de atualidade da tendência",
+      "body": "por que o tema virou tendência agora e por que é interessante"
+    }
+  ]
+}
+5-7 histórias em "stories". "trends" pode ser um array vazio se não havia tendências nos dados brutos. Cada história e cada tendência DEVEM ter o campo "date" preenchido — sem data, o item não é aceito.`;
   
   let userContent = `Datas: ${dates.twoDaysAgo} a ${dates.today} (hoje: ${dates.todayISO})\n\n`;
   userContent += `⚠️ IMPORTANTE: Cole APENAS histórias e tendências das últimas 72 horas. Descarte qualquer coisa mais antiga. Priorize histórias com "fator uau" — interessantes, engraçadas, surpreendentes e virais.\n\n`;
@@ -574,12 +584,41 @@ Formato da resposta:
     });
     
     if (result.status === 200 && result.data && result.data.choices && result.data.choices[0]) {
-      return result.data.choices[0].message.content;
+      const raw = result.data.choices[0].message.content;
+      return parseDigestJSON(raw);
     }
     console.error('AI response error:', result.status, JSON.stringify(result.data).substring(0, 300));
     return null;
   } catch (error) {
     console.error('AI generate failed:', error.message);
+    return null;
+  }
+}
+
+// Parses generateDigest()'s LLM response into { summary, stories, trends }.
+// The prompt asks for strict JSON, but models sometimes wrap it in a
+// ```json fence anyway despite instructions not to — stripped defensively
+// before parsing. Returns null (not a partial/malformed object) on any
+// parse failure or missing "stories" array, so callers can fall back to
+// "couldn't generate a digest right now" instead of sending broken output.
+function parseDigestJSON(raw) {
+  if (!raw) return null;
+  let text = raw.trim();
+  const fenceMatch = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  if (fenceMatch) text = fenceMatch[1].trim();
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || !Array.isArray(parsed.stories)) {
+      console.error('Digest JSON missing "stories" array:', text.substring(0, 300));
+      return null;
+    }
+    return {
+      summary: typeof parsed.summary === 'string' ? parsed.summary : '',
+      stories: parsed.stories.filter(s => s && s.title),
+      trends: Array.isArray(parsed.trends) ? parsed.trends.filter(t => t && t.topic) : []
+    };
+  } catch (error) {
+    console.error('Digest JSON parse failed:', error.message, '| raw (truncated):', text.substring(0, 300));
     return null;
   }
 }
@@ -852,6 +891,141 @@ function dedupeAndScoreHeadlines(items) {
     blockedRepeats
   };
   return result;
+}
+
+// --- Per-story feedback and digest delivery (sprint 7) -------------------
+// A short, stable, deterministic id for a story, derived from its
+// normalized title. Needs to survive a round trip through a keyboard
+// button's ACTION_VALUE (short string, no spaces/newlines) and stay the
+// same for the "same" story across re-runs, so djb2-style string hash to
+// base36 rather than anything random or position-dependent.
+function hashStory(title) {
+  const normalized = normalizeForDedup(title);
+  let hash = 5381;
+  for (let i = 0; i < normalized.length; i++) {
+    hash = ((hash * 33) ^ normalized.charCodeAt(i)) >>> 0;
+  }
+  return hash.toString(36);
+}
+
+const STORY_FEEDBACK_HISTORY_LIMIT = 50; // most recent per-story reactions kept for /status
+
+// In-memory lookup from story hash -> { topic, title }, populated whenever
+// sendDigestAsMessages() actually sends a story, so a later 👍/👎 tap can
+// resolve which topic to credit/blame. Deliberately NOT persisted to disk:
+// it's a short-lived index over "stories currently sitting in someone's
+// chat with live buttons", not a feedback record — settings.storyFeedback
+// is the actual persisted log. A restart between sending a digest and
+// someone tapping its buttons is an acceptably rare edge case (falls back
+// to the "Без темы" bucket in recordStoryFeedback, same as an unknown/old
+// hash) rather than something worth the complexity of persisting this too.
+// Capped so a long-running process can't leak memory across many digests.
+const STORY_LOOKUP_CACHE_LIMIT = 500;
+const storyLookupCache = new Map(); // hash -> { topic, title }
+
+function rememberStoryForFeedback(hash, topic, title) {
+  storyLookupCache.set(hash, { topic, title });
+  if (storyLookupCache.size > STORY_LOOKUP_CACHE_LIMIT) {
+    const oldestKey = storyLookupCache.keys().next().value;
+    storyLookupCache.delete(oldestKey);
+  }
+}
+
+function getStoryFeedbackKeyboard(storyHash) {
+  return [
+    { TEXT: '👍', ACTION: 'SEND', ACTION_VALUE: `/storyfeedback ${storyHash} good`, BG_COLOR_TOKEN: 'primary', DISPLAY: 'LINE' },
+    { TEXT: '👎', ACTION: 'SEND', ACTION_VALUE: `/storyfeedback ${storyHash} bad`, BG_COLOR_TOKEN: 'alert', DISPLAY: 'LINE' }
+  ];
+}
+
+// Records a single story-level reaction. Deliberately one tap, no follow-up
+// question (unlike digest-level /feedback bad, which asks what was wrong) —
+// asking for a written reason on every individual story would make the
+// per-story keyboard annoying to use, defeating the point of it being
+// lower-friction than the whole-digest feedback.
+function recordStoryFeedback(storyHash, topic, title, reaction) {
+  if (!settings.storyFeedback) settings.storyFeedback = { topicCounts: {}, recentReactions: [] };
+  const safeTopic = topic || 'Без темы';
+  if (!settings.storyFeedback.topicCounts[safeTopic]) {
+    settings.storyFeedback.topicCounts[safeTopic] = { good: 0, bad: 0 };
+  }
+  settings.storyFeedback.topicCounts[safeTopic][reaction]++;
+  settings.storyFeedback.recentReactions.unshift({
+    hash: storyHash,
+    topic: safeTopic,
+    title: title || '',
+    reaction,
+    ts: new Date().toISOString()
+  });
+  settings.storyFeedback.recentReactions = settings.storyFeedback.recentReactions.slice(0, STORY_FEEDBACK_HISTORY_LIMIT);
+  saveSettings();
+}
+
+// One-line /status summary: total per-story reactions + the single
+// most-disliked topic if any topic has at least MIN_REACTIONS_FOR_SIGNAL
+// reactions against it (avoids calling out a topic off just 1 stray tap).
+const MIN_REACTIONS_FOR_SIGNAL = 3;
+function formatStoryFeedbackSummary() {
+  const counts = (settings.storyFeedback && settings.storyFeedback.topicCounts) || {};
+  const topics = Object.entries(counts);
+  if (topics.length === 0) return `📝 Оценки историй: пока нет данных\n`;
+
+  let totalGood = 0, totalBad = 0;
+  let worstTopic = null, worstBad = 0;
+  for (const [topic, c] of topics) {
+    totalGood += c.good;
+    totalBad += c.bad;
+    const total = c.good + c.bad;
+    if (total >= MIN_REACTIONS_FOR_SIGNAL && c.bad > worstBad) {
+      worstBad = c.bad;
+      worstTopic = topic;
+    }
+  }
+  const worstNote = worstTopic ? `, чаще всего 👎 — «${worstTopic}»` : '';
+  return `📝 Оценки историй: ${totalGood} 👍 / ${totalBad} 👎${worstNote}\n`;
+}
+
+// Sends a digest (the { summary, stories, trends } shape parseDigestJSON()
+// returns) as one message per story instead of one giant block of text —
+// each story gets its own 👍/👎 keyboard via getStoryFeedbackKeyboard().
+// `introText` is the header line shown before the first story (kept
+// caller-supplied since the daily briefing, /showtrends, and /surprise each
+// want different wording here). `kind` is only used for a fallback title if
+// a story is somehow missing a topic. Records every sent story into
+// recentlySentHeadlines (sprint 6) so a manual re-run doesn't repeat them.
+async function sendDigestAsMessages(dialogId, digest, introText) {
+  const lines = [introText];
+  if (digest.summary) lines.push(`📌 ${digest.summary}`);
+  await sendBotMessage(dialogId, lines.join('\n\n'), getMainKeyboard());
+
+  for (const story of digest.stories) {
+    const parts = [];
+    parts.push(`*${story.topic || 'Интересное'}: ${story.title}*`);
+    if (story.date) parts.push(`📅 ${story.date}`);
+    if (story.body) parts.push(story.body);
+    if (story.why) parts.push(story.why);
+    if (story.source) parts.push(`🔗 ${story.source}`);
+    const storyHash = hashStory(story.title);
+    rememberStoryForFeedback(storyHash, story.topic || null, story.title || null);
+    await sendBotMessage(dialogId, parts.join('\n'), getStoryFeedbackKeyboard(storyHash));
+    await new Promise(resolve => setTimeout(resolve, 400)); // avoid hammering the API with a burst of sends
+  }
+
+  if (digest.trends && digest.trends.length > 0) {
+    const trendLines = ['🔥 *Тренды (свежие)*'];
+    for (const t of digest.trends) {
+      trendLines.push('');
+      trendLines.push(`*${t.topic}*`);
+      if (t.date) trendLines.push(`📅 ${t.date}`);
+      if (t.body) trendLines.push(t.body);
+    }
+    await sendBotMessage(dialogId, trendLines.join('\n'), getFeedbackKeyboard());
+  } else {
+    await sendBotMessage(dialogId, 'Оцени дайджест в целом:', getFeedbackKeyboard());
+  }
+
+  const sentTitles = digest.stories.map(s => s.title).filter(Boolean);
+  if (sentTitles.length > 0) recordSentHeadlines(sentTitles);
 }
 
 const SOURCES = [
@@ -1199,15 +1373,19 @@ async function sendDailyBriefing(dialogId) {
   const digest = await withTyping(dialogId, 'IMBOT_AGENT_ACTION_GENERATING', () =>
     generateDigest(rawNews, trendNews, sourceNews)
   );
-  if (!digest) {
+  if (!digest || digest.stories.length === 0) {
     await sendBotMessage(dialogId, '❌ Не удалось сгенерировать дайджест. Попробуй ещё раз.', getMainKeyboard());
     return false;
   }
   
-  // Send digest with feedback buttons
-  const sent = await sendBotMessage(dialogId, digest, getFeedbackKeyboard());
-  console.log(`[${new Date().toISOString()}] Briefing ${sent ? 'sent' : 'failed'} (${rawNews.length} news, ${trendNews.length} trends, ${sourceNews.length} sources)`);
-  return sent;
+  // Send digest as one message per story (sprint 7), each with its own
+  // 👍/👎 keyboard, instead of one giant block of text.
+  const introText = settings.lang === 'ru'
+    ? `✨ *Борис: самое интересное сегодня*\n📅 ${formatDateBR(new Date())}`
+    : `✨ *Boris: o mais interessante hoje*\n📅 ${formatDateBR(new Date())}`;
+  await sendDigestAsMessages(dialogId, digest, introText);
+  console.log(`[${new Date().toISOString()}] Briefing sent (${rawNews.length} news, ${trendNews.length} trends, ${sourceNews.length} sources, ${digest.stories.length} stories delivered)`);
+  return true;
 }
 
 // Guard: prevent the same heavy job type from running twice in parallel.
@@ -1268,8 +1446,11 @@ async function handleCommand(command, params, dialogId) {
           return;
         }
         const trendDigest = await withTyping(dialogId, 'IMBOT_AGENT_ACTION_GENERATING', () => generateDigest([], trendNews));
-        if (trendDigest) {
-          await sendBotMessage(dialogId, trendDigest, getFeedbackKeyboard());
+        if (trendDigest && trendDigest.stories.length > 0) {
+          const introText = settings.lang === 'ru' ? '🔥 *Свежие тренды*' : '🔥 *Tendências frescas*';
+          await sendDigestAsMessages(dialogId, trendDigest, introText);
+        } else {
+          await sendBotMessage(dialogId, '❌ Не удалось сгенерировать дайджест трендов. Попробуй ещё раз.', getMainKeyboard());
         }
       }, 'trends');
       break;
@@ -1286,8 +1467,11 @@ async function handleCommand(command, params, dialogId) {
         }
         const pick = surpriseNews[Math.floor(Math.random() * surpriseNews.length)];
         const surpriseDigest = await withTyping(dialogId, 'IMBOT_AGENT_ACTION_GENERATING', () => generateDigest([pick], []));
-        if (surpriseDigest) {
-          await sendBotMessage(dialogId, surpriseDigest, getFeedbackKeyboard());
+        if (surpriseDigest && surpriseDigest.stories.length > 0) {
+          const introText = settings.lang === 'ru' ? '🎲 *Случайная история*' : '🎲 *História aleatória*';
+          await sendDigestAsMessages(dialogId, surpriseDigest, introText);
+        } else {
+          await sendBotMessage(dialogId, '❌ Не удалось сгенерировать историю. Попробуй ещё раз.', getMainKeyboard());
         }
       }, 'surprise');
       break;
@@ -1318,7 +1502,29 @@ async function handleCommand(command, params, dialogId) {
         await sendBotMessage(dialogId, 'Используйте кнопки 👍 или 👎 для оценки.', getFeedbackKeyboard());
       }
       break;
-      
+
+    case 'storyfeedback': {
+      // Triggered by the 👍/👎 buttons under an individual story
+      // (sprint 7) — ACTION_VALUE is "/storyfeedback <hash> good|bad".
+      // Deliberately no follow-up question here (unlike /feedback bad
+      // above) — see recordStoryFeedback()'s comment for why.
+      const [storyHash, reaction] = params.split(' ');
+      if (!storyHash || (reaction !== 'good' && reaction !== 'bad')) {
+        await sendBotMessage(dialogId, '❌ Не удалось разобрать оценку истории.', getMainKeyboard());
+        break;
+      }
+      // Resolve topic/title from the in-memory send-time cache. Falls back
+      // to "Без темы" (inside recordStoryFeedback) if the process restarted
+      // since this story was sent, or the cache evicted it — the reaction
+      // itself is still recorded either way, just without topic attribution.
+      const cached = storyLookupCache.get(storyHash);
+      const topic = cached ? cached.topic : null;
+      const title = cached ? cached.title : null;
+      recordStoryFeedback(storyHash, topic, title, reaction);
+      await sendBotMessage(dialogId, reaction === 'good' ? '👍 Учтено!' : '👎 Учтено, буду показывать поменьше такого.', null);
+      break;
+    }
+
     case 'help':
       await sendBotMessage(dialogId,
         '🤖 *Борис — помощь*\n\n' +
@@ -1341,7 +1547,7 @@ async function handleCommand(command, params, dialogId) {
         '• /schedule — расписание\n' +
         '• /settime <ЧЧ:ММ> — время\n' +
         '• /on|/off — автосбор\n' +
-        '• /feedback good|bad — оценка\n' +
+        '• /feedback good|bad — оценка дайджеста целиком (по историям — кнопки 👍/👎 под каждой)\n' +
         '• /reset — очистить память диалога\n' +
         '• /sourcehealth — состояние источников новостей\n' +
         '• /menu — открыть меню с кнопками\n\n' +
@@ -1357,6 +1563,7 @@ async function handleCommand(command, params, dialogId) {
       const healthLine = unhealthy.length > 0
         ? `⚠️ Проблемные источники (0 результатов ${SOURCE_HEALTH_ALERT_THRESHOLD}+ раз подряд): ${unhealthy.map(h => h.id).join(', ')} — см. /sourcehealth\n`
         : `✅ Все источники в норме\n`;
+      const storyFeedbackLine = formatStoryFeedbackSummary();
       await sendBotMessage(dialogId,
         `📊 *Статус Бориса*\n\n` +
         `✅ Бот активен\n` +
@@ -1364,7 +1571,8 @@ async function handleCommand(command, params, dialogId) {
         `🌐 Язык: ${settings.lang === 'ru' ? 'Русский' : 'Português'}\n` +
         `🔥 Тренды (макс 72ч): ${settings.includeTrends ? 'вкл' : 'выкл'}\n` +
         `⏰ Автосбор: ${settings.autoSend ? 'вкл' : 'выкл'} (${settings.time} ${settings.timezone})\n` +
-        `👍 Оценки: ${settings.feedback.good} 👍 / ${settings.feedback.bad} 👎\n` +
+        `👍 Оценки дайджеста: ${settings.feedback.good} 👍 / ${settings.feedback.bad} 👎\n` +
+        storyFeedbackLine +
         `🧠 AI-генерация дайджеста: включена\n` +
         `💬 Свободный диалог через LLM: включен (память ${MAX_HISTORY_TURNS} реплик, /reset — очистить)\n` +
         `🧹 Дедуп (посл. сбор): ${lastDedupStats.input} → ${lastDedupStats.output} (склеено ${lastDedupStats.collapsed}, повторов заблокировано ${lastDedupStats.blockedRepeats})\n` +
